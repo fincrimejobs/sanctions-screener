@@ -18,15 +18,17 @@ class ScreenerInput(BaseModel):
 
 @app.get("/")
 def home():
-    return {"message": "Single Screener API is Live"}
+    return {"message": "Screener API is Live"}
 
 @app.post("/screen")
 def screen_person(item: ScreenerInput):
-    # Use the standard key. If missing, it might work on free tier (rate limited)
-    api_key = os.getenv("OPENSANCTIONS_KEY", "")
-    url = f"https://api.opensanctions.org/match/default?api_key={api_key}"
+    # 1. Get Key and TRIM whitespace (Fixes copy-paste errors)
+    api_key = os.getenv("OPENSANCTIONS_KEY", "").strip()
     
-    # Simple Query
+    # 2. Use Headers instead of URL (More reliable)
+    url = "https://api.opensanctions.org/match/default"
+    headers = {"Authorization": f"ApiKey {api_key}"}
+    
     payload = {
         "queries": {
             "q1": {
@@ -37,18 +39,21 @@ def screen_person(item: ScreenerInput):
     }
     
     try:
-        resp = requests.post(url, json=payload)
+        # Send request with Headers
+        resp = requests.post(url, json=payload, headers=headers)
         
-        # Safety: Check if API failed
+        # 3. DIAGNOSTIC: If it fails, return the EXACT reason
         if resp.status_code != 200:
-            return {"status": "error", "message": "External API Error"}
+            return {
+                "status": "error", 
+                "message": f"API Error {resp.status_code}: {resp.text}"
+            }
 
         data = resp.json()
         results = data.get("responses", {}).get("q1", {}).get("results", [])
         
         hits = []
         for result in results:
-            # 60% Match Threshold
             if result['score'] >= 0.6: 
                 props = result['properties']
                 hits.append({
