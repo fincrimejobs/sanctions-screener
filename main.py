@@ -6,15 +6,13 @@ import os
 
 app = FastAPI()
 
-# Allow Webflow to talk to this code
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allows all websites to connect
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# The data we expect from Webflow
 class ScreenerInput(BaseModel):
     name: str
 
@@ -24,10 +22,10 @@ def home():
 
 @app.post("/screen")
 def screen_person(item: ScreenerInput):
-    api_key = os.getenv("OPENSANCTIONS_KEY")
+    # Use the default key if not set in env
+    api_key = os.getenv("OPENSANCTIONS_KEY", "") 
     url = f"https://api.opensanctions.org/match/default?api_key={api_key}"
     
-    # Prepare data for OpenSanctions
     payload = {
         "queries": {
             "q1": {
@@ -37,22 +35,26 @@ def screen_person(item: ScreenerInput):
         }
     }
     
-    # Ask OpenSanctions
     response = requests.post(url, json=payload)
     data = response.json()
-    
-    # Process results
     results = data.get("responses", {}).get("q1", {}).get("results", [])
     
-    # Simple logic: If we have results with high score, it's a hit
     hits = []
     for result in results:
-        if result['score'] > 0.7: # 70% match threshold
-            hits.append({
+        # 0.7 means 70% match confidence
+        if result['score'] > 0.7: 
+            props = result['properties']
+            
+            # Extract professional details
+            hit_data = {
                 "name": result['caption'],
-                "score": result['score'],
-                "datasets": result['datasets']
-            })
+                "score": int(result['score'] * 100), # Convert to percentage (e.g., 95)
+                "datasets": ", ".join(result['datasets']), # List of sanctions lists
+                "birth_date": props.get("birthDate", ["Unknown"])[0],
+                "nationality": props.get("nationality", ["Unknown"])[0],
+                "topics": ", ".join(props.get("topics", [])) # e.g., "role.pep"
+            }
+            hits.append(hit_data)
             
     return {
         "status": "hit" if len(hits) > 0 else "clean",
