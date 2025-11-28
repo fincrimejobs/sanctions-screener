@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
@@ -24,91 +24,79 @@ class BatchInput(BaseModel):
 def home():
     return {"message": "Screener API is running!"}
 
-# --- HELPER: LOGIC TO PROCESS ONE RESULT ---
-def extract_hit_details(results):
-    hits = []
-    for result in results:
-        # Lower threshold slightly to 0.6 (60%) to ensure we see results
-        if result['score'] >= 0.6: 
-            props = result['properties']
-            hits.append({
-                "name": result['caption'],
-                "score": int(result['score'] * 100),
-                "datasets": ", ".join(result['datasets']),
-                "birth_date": props.get("birthDate", ["Unknown"])[0],
-                "nationality": props.get("nationality", ["Unknown"])[0],
-                "topics": ", ".join(props.get("topics", []))
-            })
-    return hits
-
-# --- SINGLE SCREENING ---
 @app.post("/screen")
 def screen_person(item: ScreenerInput):
-    # Try Bulk Key first, then Standard Key
+    # Fallback logic
     api_key = os.getenv("BULK_API_KEY") or os.getenv("OPENSANCTIONS_KEY", "")
-    
     url = f"https://api.opensanctions.org/match/default?api_key={api_key}"
-    payload = {
-        "queries": { "q1": { "schema": "Person", "properties": {"name": [item.name]} } }
-    }
+    
+    payload = {"queries": {"q1": {"schema": "Person", "properties": {"name": [item.name]}}}}
     
     try:
         resp = requests.post(url, json=payload)
         data = resp.json()
         results = data.get("responses", {}).get("q1", {}).get("results", [])
-        hits = extract_hit_details(results)
+        
+        hits = []
+        for result in results:
+            if result['score'] >= 0.6: 
+                hits.append({
+                    "name": result['caption'],
+                    "score": int(result['score'] * 100),
+                    "datasets": ", ".join(result['datasets']),
+                    "birth_date": result['properties'].get("birthDate", ["Unknown"])[0],
+                    "nationality": result['properties'].get("nationality", ["Unknown"])[0]
+                })
         return {"status": "hit" if hits else "clean", "matches": hits}
     except Exception as e:
-        print(f"Error: {e}")
-        return {"status": "clean", "matches": []}
+        return {"status": "error", "error_details": str(e)}
 
-# --- BULK SCREENING ---
 @app.post("/batch")
 def batch_screen(item: BatchInput):
-    # SAFETY CHECK 1: Key Fallback
-    # If BULK_API_KEY is missing, it will use your working OPENSANCTIONS_KEY
-    api_key = os.getenv("BULK_API_KEY") or os.getenv("OPENSANCTIONS_KEY", "")
+    # 1. Grab Keys
+    bulk_key = os.getenv("BULK_API_KEY")
+    std_key = os.getenv("OPENSANCTIONS_KEY")
     
+    # 2. DEBUG INFO: Return this if it fails
+    debug_info = {
+        "key_used": "BULK" if bulk_key else ("STANDARD" if std_key else "NONE"),
+        "key_length": len(bulk_key) if bulk_key else 0
+    }
+
+    api_key = bulk_key or std_key or ""
     url = f"https://api.opensanctions.org/match/default?api_key={api_key}"
     
-    # SAFETY CHECK 2: Limit batch size to 50 to prevent timeouts
-    names_to_process = item.names[:50]
-    
     queries = {}
-    for index, name in enumerate(names_to_process):
+    for index, name in enumerate(item.names):
         if name.strip():
-            # Create a unique ID for every row
-            queries[f"row_{index}"] = {
-                "schema": "Person", 
-                "properties": {"name": [name]}
-            }
+            queries[f"row_{index}"] = {"schema": "Person", "properties": {"name": [name]}}
 
     if not queries:
-        return {"batch_results": []}
+        return {"error": "No valid names provided"}
 
     try:
         response = requests.post(url, json={"queries": queries})
         
-        # SAFETY CHECK 3: If API fails, print error to Render logs
+        # --- DIAGNOSTIC BLOCK ---
+        # If the external API fails, we return the EXACT message they sent us
         if response.status_code != 200:
-            print(f"External API Failed: {response.text}")
-            raise HTTPException(status_code=500, detail="Sanctions Provider Error")
-            
-        data = response.json().get("responses", {})
+            return {
+                "batch_results": [],
+                "ERROR_TYPE": "External API Failed",
+                "STATUS_CODE": response.status_code,
+                "SERVER_RESPONSE": response.text, 
+                "DEBUG_INFO": debug_info
+            }
+        # ------------------------
 
+        data = response.json().get("responses", {})
         final_output = []
         
-        # We must loop through the ORIGINAL names to keep order
-        for index, name in enumerate(names_to_process):
+        for index, name in enumerate(item.names):
             query_id = f"row_{index}"
-            
-            # Check if we got a response for this ID
-            val = data.get(query_id, {})
-            results = val.get("results", [])
+            results = data.get(query_id, {}).get("results", [])
             
             best_match = None
-            
-            # Find the highest score
             if results and results[0]['score'] >= 0.6:
                 r = results[0]
                 best_match = {
@@ -126,6 +114,10 @@ def batch_screen(item: BatchInput):
         return {"batch_results": final_output}
 
     except Exception as e:
-        print(f"Batch Error: {e}")
-        # Return empty list so frontend doesn't crash
-        return {"batch_results": []}
+        # If Python crashes, return the crash report
+        return {
+            "batch_results": [],
+            "ERROR_TYPE": "Internal Python Crash",
+            "DETAILS": str(e),
+            "DEBUG_INFO": debug_info
+        }
