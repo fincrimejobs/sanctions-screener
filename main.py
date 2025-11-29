@@ -47,7 +47,7 @@ def screen_person(item: ScreenerInput):
     # Simple logic: If we have results with high score, it's a hit
     hits = []
     for result in results:
-        if result['score'] > 0.7: # 70% match threshold
+        if result['score'] > 0.7: # 70% match thresholdd
             hits.append({
                 "name": result['caption'],
                 "score": result['score'],
