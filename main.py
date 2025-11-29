@@ -16,7 +16,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# This handles the input parsing automatically (Fixes the {} error)
+# This model expects {"name": "Vladimir Putin"}
 class ScreenerInput(BaseModel):
     name: str
 
