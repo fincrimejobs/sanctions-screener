@@ -6,29 +6,32 @@ import os
 
 app = FastAPI()
 
+# 1. SECURITY: Allow everyone (Fixes CORS)
+origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# 2. INPUT: Expects {"name": "Putin"}
 class ScreenerInput(BaseModel):
     name: str
 
 @app.get("/")
 def home():
-    return {"message": "Screener API is Live"}
+    return {"message": "Simple Screener is Live"}
 
 @app.post("/screen")
 def screen_person(item: ScreenerInput):
-    # 1. Get Key and TRIM whitespace (Fixes copy-paste errors)
+    # 3. SETUP
     api_key = os.getenv("OPENSANCTIONS_KEY", "").strip()
-    
-    # 2. Use Headers instead of URL (More reliable)
     url = "https://api.opensanctions.org/match/default"
     headers = {"Authorization": f"ApiKey {api_key}"}
     
+    # 4. QUERY
     payload = {
         "queries": {
             "q1": {
@@ -39,31 +42,19 @@ def screen_person(item: ScreenerInput):
     }
     
     try:
-        # Send request with Headers
         resp = requests.post(url, json=payload, headers=headers)
-        
-        # 3. DIAGNOSTIC: If it fails, return the EXACT reason
-        if resp.status_code != 200:
-            return {
-                "status": "error", 
-                "message": f"API Error {resp.status_code}: {resp.text}"
-            }
-
         data = resp.json()
         results = data.get("responses", {}).get("q1", {}).get("results", [])
         
+        # 5. LOGIC: Is there a match > 60%?
         hits = []
         for result in results:
-            if result['score'] >= 0.6: 
-                props = result['properties']
+            if result['score'] >= 0.6:
                 hits.append({
                     "name": result['caption'],
-                    "score": int(result['score'] * 100),
-                    "datasets": ", ".join(result['datasets']),
-                    "birth_date": props.get("birthDate", ["Unknown"])[0],
-                    "nationality": props.get("nationality", ["Unknown"])[0]
+                    "score": int(result['score'] * 100)
                 })
-                
+        
         return {"status": "hit" if hits else "clean", "matches": hits}
 
     except Exception as e:
