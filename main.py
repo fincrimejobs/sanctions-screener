@@ -6,7 +6,8 @@ import os
 
 app = FastAPI()
 
-# 1. SECURITY: Allow everyone (Fixes CORS)
+# 1. SECURITY: ALLOW *EVERYONE*
+# This is the line that fixes your current error.
 origins = ["*"]
 
 app.add_middleware(
@@ -16,22 +17,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. INPUT: Expects {"name": "Putin"}
 class ScreenerInput(BaseModel):
     name: str
 
 @app.get("/")
 def home():
-    return {"message": "Simple Screener is Live"}
+    return {"message": "Screener API is Live"}
 
 @app.post("/screen")
 def screen_person(item: ScreenerInput):
-    # 3. SETUP
+    # API Key
     api_key = os.getenv("OPENSANCTIONS_KEY", "").strip()
+    
     url = "https://api.opensanctions.org/match/default"
     headers = {"Authorization": f"ApiKey {api_key}"}
     
-    # 4. QUERY
     payload = {
         "queries": {
             "q1": {
@@ -46,10 +46,9 @@ def screen_person(item: ScreenerInput):
         data = resp.json()
         results = data.get("responses", {}).get("q1", {}).get("results", [])
         
-        # 5. LOGIC: Is there a match > 60%?
         hits = []
         for result in results:
-            if result['score'] >= 0.6:
+            if result['score'] >= 0.6: 
                 hits.append({
                     "name": result['caption'],
                     "score": int(result['score'] * 100)
