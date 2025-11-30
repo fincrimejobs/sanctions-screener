@@ -5,6 +5,11 @@ from pydantic import BaseModel
 from typing import Any, Dict, List
 import requests
 import os
+import logging
+
+# Basic logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("screener")
 
 app = FastAPI()
 
@@ -56,32 +61,67 @@ def screen_person(item: ScreenerInput):
     if not api_key:
         raise HTTPException(status_code=500, detail="Server misconfigured: OPENSANCTIONS_KEY not set")
 
+    # Allow deploy-time override for how many results we request from the upstream API.
+    # Note: upstream/yente may enforce its own hard cap; this only requests more.
+    try:
+        MAX_RESULTS = int(os.getenv("OPENSANCTIONS_MAX_RESULTS", "50"))
+    except Exception:
+        MAX_RESULTS = 50
+
     url = f"https://api.opensanctions.org/match/default?api_key={api_key}"
+
+    # Add options.maximumResults to request more results from upstream matching service
     payload = {
         "queries": {
             "q1": {
                 "schema": "Person",
                 "properties": {"name": [item.name]}
             }
+        },
+        # yente/OpenSanctions often accepts an 'options' object — set maximumResults here.
+        # If the upstream service uses a different name, this will be harmless (it will be ignored).
+        "options": {
+            "maximumResults": MAX_RESULTS
         }
     }
 
+    logger.info("Submitting matching request to OpenSanctions (max_results=%s) for name=%s", MAX_RESULTS, item.name)
+
     try:
-        resp = requests.post(url, json=payload, timeout=15)
+        resp = requests.post(url, json=payload, timeout=30)
     except requests.RequestException as e:
+        logger.exception("Upstream request failed")
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {str(e)}")
 
     if resp.status_code != 200:
+        logger.error("Upstream returned non-200: %s body=%s", resp.status_code, resp.text[:2000])
         raise HTTPException(status_code=502, detail=f"Upstream returned {resp.status_code}: {resp.text[:1000]}")
 
     try:
         data = resp.json()
     except ValueError:
+        logger.error("Upstream returned non-JSON response")
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON response")
 
-    results = data.get("responses", {}).get("q1", {}).get("results", [])
+    # Attempt to find results in a few likely places
+    results = []
+    # canonical yente response shape: {"responses": {"q1": {"results": [...]}}}
+    try:
+        results = data.get("responses", {}).get("q1", {}).get("results", [])
+    except Exception:
+        results = []
+
+    # fallback: sometimes the API returns an array directly, or under 'matches' / 'results'
+    if not isinstance(results, list) or len(results) == 0:
+        if isinstance(data, list):
+            results = data
+        else:
+            results = data.get("matches") or data.get("results") or results
+
     if not isinstance(results, list):
         results = []
+
+    logger.info("Upstream returned %d raw result(s)", len(results))
 
     matches = []
     for r in results:
@@ -94,7 +134,10 @@ def screen_person(item: ScreenerInput):
         if isinstance(datasets, str):
             datasets = [datasets]
         if not isinstance(datasets, list):
-            datasets = list(datasets) if datasets else []
+            try:
+                datasets = list(datasets) if datasets else []
+            except Exception:
+                datasets = []
 
         # Sources: try multiple possible places
         sources = []
@@ -119,18 +162,18 @@ def screen_person(item: ScreenerInput):
             if isinstance(aliases, str):
                 aliases = [aliases]
             elif isinstance(aliases, dict):
-                # try to pull the name fields
                 aliases = [v for v in aliases.values() if isinstance(v, str)]
             elif isinstance(aliases, list):
-                # ok
                 aliases = [a for a in aliases if isinstance(a, str)]
             else:
                 aliases = []
+        else:
+            aliases = []
 
         # place_of_birth
         pob = recursive_find(r, ["birth_place", "place_of_birth", "born_in"])
 
-        # Build match entry
+        # Build match entry — keep raw small but include entire raw if you want (comment below)
         matches.append({
             "name": name,
             "score": score,
@@ -140,17 +183,19 @@ def screen_person(item: ScreenerInput):
                 "date_of_birth": dob,
                 "place_of_birth": pob,
                 "nationality": nationality,
-                "aliases": aliases or []
+                "aliases": aliases
             },
-            # include raw result for advanced UI/dev debugging (optional, small)
-            # Remove or limit in production if payloads are large
-            "raw": {k: v for k, v in r.items() if k in ("caption", "score", "datasets")}
+            # keep small 'raw' by default to avoid huge payloads; adjust as needed
+            "raw": {k: v for k, v in r.items() if k in ("caption", "score", "datasets", "id")}
         })
 
     status = "hit" if len([m for m in matches if m.get("score", 0) > 0.7]) > 0 else "clean"
 
+    # Return additional debug info so frontend/test can verify how many upstream results existed
     return {
         "status": status,
         "query": item.name,
-        "matches": matches
+        "matches": matches,
+        "raw_results_count": len(results),
+        "requested_max_results": MAX_RESULTS
     }
