@@ -5,6 +5,10 @@ from pydantic import BaseModel
 from typing import Any, Dict, List
 import requests
 import os
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("screener")
 
 app = FastAPI()
 
@@ -20,16 +24,12 @@ class ScreenerInput(BaseModel):
     name: str
 
 def recursive_find(obj: Any, keys: List[str]):
-    """Recursively search a nested dict/list for the first matching key (case-insensitive).
-       Returns the value or None."""
     if obj is None:
         return None
-
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k and isinstance(k, str) and k.lower() in [kk.lower() for kk in keys]:
                 return v
-            # recurse
             val = recursive_find(v, keys)
             if val is not None:
                 return val
@@ -46,6 +46,63 @@ def coerce_score(s):
     except Exception:
         return 0.0
 
+def normalize_result_record(r: Dict[str,Any]) -> Dict[str,Any]:
+    name = r.get("caption") or r.get("name") or recursive_find(r, ["name", "caption"]) or ""
+    score = coerce_score(r.get("score", 0))
+    datasets = r.get("datasets") or r.get("dataset") or recursive_find(r, ["datasets", "dataset", "lists"]) or []
+    if isinstance(datasets, str):
+        datasets = [datasets]
+    if not isinstance(datasets, list):
+        try:
+            datasets = list(datasets) if datasets else []
+        except Exception:
+            datasets = []
+
+    # sources
+    sources = []
+    if r.get("sources"):
+        sources = r.get("sources")
+    else:
+        e = r.get("entity") or r.get("record") or r
+        s = recursive_find(e, ["sources", "source", "urls", "url", "links", "link"])
+        if s:
+            if isinstance(s, list):
+                sources = s
+            elif isinstance(s, str):
+                sources = [s]
+
+    dob = recursive_find(r, ["birth_date", "date_of_birth", "dob", "birthdate"])
+    nationality = recursive_find(r, ["nationality", "country", "citizenship", "country_of_residence", "citizenships"])
+    aliases = recursive_find(r, ["other_names", "aliases", "aka", "alternate_names", "names"])
+    if aliases:
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        elif isinstance(aliases, dict):
+            aliases = [v for v in aliases.values() if isinstance(v, str)]
+        elif isinstance(aliases, list):
+            aliases = [a for a in aliases if isinstance(a, str)]
+        else:
+            aliases = []
+    else:
+        aliases = []
+
+    pob = recursive_find(r, ["birth_place", "place_of_birth", "born_in"])
+
+    return {
+        "name": name,
+        "score": score,
+        "datasets": datasets,
+        "sources": sources,
+        "identity": {
+            "date_of_birth": dob,
+            "place_of_birth": pob,
+            "nationality": nationality,
+            "aliases": aliases
+        },
+        # keep small raw to avoid huge payloads
+        "raw": {k: v for k, v in r.items() if k in ("caption", "score", "datasets", "id")}
+    }
+
 @app.get("/")
 def home():
     return {"message": "Screener API is running!"}
@@ -56,101 +113,106 @@ def screen_person(item: ScreenerInput):
     if not api_key:
         raise HTTPException(status_code=500, detail="Server misconfigured: OPENSANCTIONS_KEY not set")
 
-    url = f"https://api.opensanctions.org/match/default?api_key={api_key}"
+    try:
+        MAX_RESULTS = int(os.getenv("OPENSANCTIONS_MAX_RESULTS", "50"))
+    except Exception:
+        MAX_RESULTS = 50
+
+    match_url = f"https://api.opensanctions.org/match/default?api_key={api_key}"
+    search_url = f"https://api.opensanctions.org/search?api_key={api_key}"
+
+    # 1) Try match endpoint first with maximumResults
     payload = {
         "queries": {
             "q1": {
                 "schema": "Person",
                 "properties": {"name": [item.name]}
             }
-        }
+        },
+        "options": {"maximumResults": MAX_RESULTS}
     }
 
+    logger.info("Calling match endpoint for name=%s (max=%s)", item.name, MAX_RESULTS)
     try:
-        resp = requests.post(url, json=payload, timeout=15)
+        resp = requests.post(match_url, json=payload, timeout=30)
     except requests.RequestException as e:
+        logger.exception("Upstream match request failed")
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {str(e)}")
 
     if resp.status_code != 200:
+        logger.error("Match endpoint returned non-200: %s", resp.status_code)
         raise HTTPException(status_code=502, detail=f"Upstream returned {resp.status_code}: {resp.text[:1000]}")
 
     try:
         data = resp.json()
     except ValueError:
+        logger.error("Match endpoint returned non-JSON")
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON response")
 
-    results = data.get("responses", {}).get("q1", {}).get("results", [])
-    if not isinstance(results, list):
-        results = []
+    match_results = []
+    try:
+        match_results = data.get("responses", {}).get("q1", {}).get("results", [])
+    except Exception:
+        match_results = []
 
-    matches = []
-    for r in results:
-        # Basic fields
-        name = r.get("caption") or r.get("name") or recursive_find(r, ["name", "caption"]) or item.name
-        score = coerce_score(r.get("score", 0))
-
-        datasets = r.get("datasets") or r.get("dataset") or recursive_find(r, ["datasets", "dataset", "lists"]) or []
-        # Ensure list
-        if isinstance(datasets, str):
-            datasets = [datasets]
-        if not isinstance(datasets, list):
-            datasets = list(datasets) if datasets else []
-
-        # Sources: try multiple possible places
-        sources = []
-        if r.get("sources"):
-            sources = r.get("sources")
+    if not isinstance(match_results, list):
+        if isinstance(data, list):
+            match_results = data
         else:
-            # try entity or record nested data
-            e = r.get("entity") or r.get("record") or r
-            s = recursive_find(e, ["sources", "source", "urls", "url", "links", "link"])
-            if s:
-                if isinstance(s, list):
-                    sources = s
-                elif isinstance(s, str):
-                    sources = [s]
+            match_results = data.get("matches") or data.get("results") or match_results
 
-        # Try to extract identity details (DOB, nationality, aliases)
-        dob = recursive_find(r, ["birth_date", "date_of_birth", "dob", "birthdate"])
-        nationality = recursive_find(r, ["nationality", "country", "citizenship", "country_of_residence", "citizenships"])
-        aliases = recursive_find(r, ["other_names", "aliases", "aka", "alternate_names", "names"])
-        # normalize aliases to list of strings
-        if aliases:
-            if isinstance(aliases, str):
-                aliases = [aliases]
-            elif isinstance(aliases, dict):
-                # try to pull the name fields
-                aliases = [v for v in aliases.values() if isinstance(v, str)]
-            elif isinstance(aliases, list):
-                # ok
-                aliases = [a for a in aliases if isinstance(a, str)]
+    match_results = match_results or []
+    logger.info("Match returned %d items", len(match_results))
+
+    # normalize + dedupe by raw.id or name+score
+    normalized = [normalize_result_record(r) for r in match_results]
+    unique = {}
+    def key_for(r):
+        raw_id = (r.get("raw") or {}).get("id")
+        if raw_id:
+            return f"id::{raw_id}"
+        return f"name::{r.get('name','')}_score::{r.get('score',0)}"
+
+    for r in normalized:
+        unique[key_for(r)] = r
+
+    raw_results_count = len(match_results)
+    used_search = False
+
+    # 2) fallback to search endpoint if we have fewer than requested
+    if len(unique) < MAX_RESULTS:
+        logger.info("Match gave %d < %d -> trying search endpoint", len(unique), MAX_RESULTS)
+        used_search = True
+        try:
+            params = {"q": item.name, "size": MAX_RESULTS}
+            sresp = requests.get(search_url, params=params, timeout=30)
+            if sresp.status_code == 200:
+                sdata = sresp.json()
+                sresults = []
+                if isinstance(sdata, dict):
+                    sresults = sdata.get("results") or sdata.get("matches") or sdata.get("hits") or []
+                elif isinstance(sdata, list):
+                    sresults = sdata
+                sresults = sresults or []
+                raw_results_count += len(sresults)
+                for r in sresults:
+                    nr = normalize_result_record(r)
+                    unique[key_for(nr)] = nr
+                    if len(unique) >= MAX_RESULTS:
+                        break
             else:
-                aliases = []
+                logger.warning("Search endpoint returned non-200: %s", sresp.status_code)
+        except requests.RequestException:
+            logger.exception("Search request failed")
 
-        # place_of_birth
-        pob = recursive_find(r, ["birth_place", "place_of_birth", "born_in"])
-
-        # Build match entry
-        matches.append({
-            "name": name,
-            "score": score,
-            "datasets": datasets,
-            "sources": sources,
-            "identity": {
-                "date_of_birth": dob,
-                "place_of_birth": pob,
-                "nationality": nationality,
-                "aliases": aliases or []
-            },
-            # include raw result for advanced UI/dev debugging (optional, small)
-            # Remove or limit in production if payloads are large
-            "raw": {k: v for k, v in r.items() if k in ("caption", "score", "datasets")}
-        })
-
-    status = "hit" if len([m for m in matches if m.get("score", 0) > 0.7]) > 0 else "clean"
+    final_matches = list(unique.values())[:MAX_RESULTS]
+    status_flag = "hit" if any(m.get("score",0) > 0.7 for m in final_matches) else "clean"
 
     return {
-        "status": status,
+        "status": status_flag,
         "query": item.name,
-        "matches": matches
+        "matches": final_matches,
+        "raw_results_count": raw_results_count,
+        "requested_max_results": MAX_RESULTS,
+        "used_search": used_search
     }
