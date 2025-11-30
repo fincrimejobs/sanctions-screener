@@ -126,6 +126,7 @@ def screen_person(item: ScreenerInput):
         "queries": {
             "q1": {
                 "schema": "Person",
+                "limit": 50, # 🚀 THIS FIXES THE 5-RESULT LIMIT
                 "properties": {"name": [item.name]}
             }
         },
