@@ -1,240 +1,399 @@
 # heatmap.py
-from fastapi import APIRouter, HTTPException, Request
-from typing import Any, Dict, List
+from fastapi import APIRouter, HTTPException
+from typing import Dict, Any, List, Iterable, Tuple
+from collections import Counter, defaultdict
 import os
 import requests
+import json
+import time
 import logging
-from collections import Counter, defaultdict
 
-router = APIRouter()
 logger = logging.getLogger("heatmap")
 logger.setLevel(logging.INFO)
 
-OPENSANCTIONS_KEY = os.getenv("OPENSANCTIONS_KEY")
+router = APIRouter(prefix="/heatmap", tags=["heatmap"])
 
-# Candidate endpoints (we try each with an appropriate HTTP method)
-CANDIDATE_ENDPOINTS = [
-    {"url": "https://api.opensanctions.org/search", "method": "POST"},
-    {"url": "https://api.opensanctions.org/entities", "method": "GET"},
-    {"url": "https://api.opensanctions.org/datasets", "method": "GET"},
-    {"url": "https://api.opensanctions.org/match/default", "method": "POST"},
-]
+# In-memory cache so we don't hammer OpenSanctions every page load
+_HEATMAP_CACHE: Dict[str, Any] = {
+    "data": None,
+    "updated_at": 0.0,
+}
 
-def _auth_params_or_headers():
-    """
-    Return (params, headers) pair to attach to requests.
-    We'll include api_key as query param if present, and also put a Token
-    header if the key might be accepted that way.
-    """
-    params = {}
-    headers = {"Accept": "application/json"}
-    if OPENSANCTIONS_KEY:
-        params["api_key"] = OPENSANCTIONS_KEY
-        # also include Authorization header as 'Token <key>' in case server requires it
-        headers["Authorization"] = f"Token {OPENSANCTIONS_KEY}"
-    return params, headers
+CACHE_TTL_SECONDS = 60 * 60 * 6  # 6 hours by default (override via HEATMAP_CACHE_TTL)
 
-def _safe_json_snippet(resp):
+
+def _get_cache_ttl() -> int:
     try:
-        j = resp.json()
-        # return small snippet to avoid large payloads
-        return {"status": resp.status_code, "snippet": j if isinstance(j, dict) else j}
+        return int(os.getenv("HEATMAP_CACHE_TTL", str(CACHE_TTL_SECONDS)))
     except Exception:
-        text = resp.text[:1000] if hasattr(resp, "text") else None
-        return {"status": getattr(resp, "status_code", None), "snippet": text}
+        return CACHE_TTL_SECONDS
 
-def _collect_candidates_from_payload(payload) -> List[Dict[str,Any]]:
+
+def get_delivery_token() -> str:
     """
-    Given JSON payload from API, try to extract a list of entity-like dicts.
-    This is defensive: OpenSanctions responses vary.
+    Look up the bulk data delivery token from environment.
+    We NEVER expose this token to the frontend.
     """
-    if not payload:
+    token = (
+        os.getenv("OPENSANCTIONS_DELIVERY_TOKEN")
+        or os.getenv("OPENSANCTIONS_BULK_TOKEN")
+        or os.getenv("OPEN_SANCTIONS_DELIVERY_TOKEN")
+    )
+    if not token:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Bulk data token not configured. "
+                "Set OPENSANCTIONS_DELIVERY_TOKEN (or OPENSANCTIONS_BULK_TOKEN)."
+            ),
+        )
+    return token.strip()
+
+
+# --- Helpers ---------------------------------------------------------------
+
+def ensure_list(v: Any) -> List[Any]:
+    if v is None:
         return []
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        # common keys
-        for k in ("results", "matches", "responses", "entities", "hits", "data"):
-            if k in payload and isinstance(payload[k], (list, tuple)):
-                return payload[k]
-        # sometimes under responses->q1->results
-        if "responses" in payload and isinstance(payload["responses"], dict):
-            for q,v in payload["responses"].items():
-                if isinstance(v, dict) and isinstance(v.get("results"), list):
-                    return v.get("results")
-        # fallback: top-level dict with items
-        return []
-    return []
+    if isinstance(v, list):
+        return v
+    return [v]
 
-def _extract_nationalities_from_entity(e) -> List[str]:
-    """Try a few keys for nationality/country fields."""
-    keys = ["nationality", "country", "citizenship", "country_of_residence", "citizenships"]
-    out = []
-    if not isinstance(e, dict):
-        return out
-    for k in keys:
-        v = e.get(k)
-        if not v:
-            # try nested identity objects
-            idv = e.get("identity") or e.get("entity")
-            if isinstance(idv, dict) and k in idv:
-                v = idv.get(k)
-        if v:
-            if isinstance(v, list):
-                out.extend([str(x) for x in v if x])
-            else:
-                out.append(str(v))
-    # dedupe & cleanup
-    return [x.strip() for x in dict.fromkeys(out) if x and str(x).strip()]
 
-@router.get("/heatmap")
-def heatmap(request: Request, max_pages: int = 2, page_size: int = 100):
+# Minimal country normalisation: simple + cheap
+_COUNTRY_MAP = {
+    "US": "United States",
+    "USA": "United States",
+    "UNITED STATES": "United States",
+    "UNITED STATES OF AMERICA": "United States",
+    "RU": "Russia",
+    "RUS": "Russia",
+    "RUSSIAN FEDERATION": "Russia",
+    "IR": "Iran",
+    "IRN": "Iran",
+    "IRAN, ISLAMIC REPUBLIC OF": "Iran",
+    "GB": "United Kingdom",
+    "UK": "United Kingdom",
+    "GBR": "United Kingdom",
+    "UNITED KINGDOM": "United Kingdom",
+    "CN": "China",
+    "CHN": "China",
+    "DE": "Germany",
+    "DEU": "Germany",
+    "FR": "France",
+    "FRA": "France",
+    "CA": "Canada",
+    "CAN": "Canada",
+    "AU": "Australia",
+    "AUS": "Australia",
+    "UA": "Ukraine",
+    "UKR": "Ukraine",
+    "BY": "Belarus",
+    "BLR": "Belarus",
+    "SY": "Syria",
+    "SYR": "Syria",
+    "KP": "North Korea",
+    "PRK": "North Korea",
+    "VE": "Venezuela",
+    "VEN": "Venezuela",
+}
+
+
+def normalize_country(raw: Any) -> List[str]:
     """
-    Defensive Heatmap endpoint.
-
-    Query params:
-      - max_pages: how many pages to attempt (per upstream endpoint)
-      - page_size: page size for search-like endpoints
-
-    Returns a JSON with:
-      - totals: aggregated counts (example: nationality -> count)
-      - samples: a few sample records
-      - meta: what upstream endpoint was used, pages fetched, etc
-      - debug: list of attempted endpoints & their first response snippets
+    Take a raw value (string or list) and return a list of normalized country labels.
+    Kept simple & robust for marketing-level heatmap.
     """
-    if not OPENSANCTIONS_KEY:
-        raise HTTPException(status_code=500, detail="Server misconfigured: OPENSANCTIONS_KEY not set")
+    out: List[str] = []
+    for val in ensure_list(raw):
+        if not val:
+            continue
+        s = str(val).strip()
+        if not s:
+            continue
 
-    params_template, headers_template = _auth_params_or_headers()
+        # Split common separators: "Russia; Cyprus"
+        parts = [p.strip() for p in s.replace("|", ",").replace(";", ",").split(",") if p.strip()]
+        if len(parts) > 1:
+            for p in parts:
+                out.extend(normalize_country(p))
+            continue
 
-    debug = {"attempts": []}
-    totals = defaultdict(int)
-    samples = []
-    datasets = defaultdict(int)
+        u = s.upper()
+        if u in _COUNTRY_MAP:
+            out.append(_COUNTRY_MAP[u])
+            continue
 
-    fetched = 0
-    used_url = None
+        # ISO-like 2 or 3 letter codes
+        if len(u) in (2, 3) and u.isalpha():
+            out.append(u)
+        else:
+            # Fallback: cleaned label
+            cleaned = s
+            if "(" in cleaned:
+                cleaned = cleaned.split("(", 1)[0].strip()
+            out.append(cleaned)
+    return out
 
-    # Try candidate endpoints until we get some entities
-    for cand in CANDIDATE_ENDPOINTS:
-        url = cand["url"]
-        method = cand["method"].upper()
-        debug_entry = {"url": url, "method": method, "pages_attempted": 0, "status_first": None, "error": None}
-        logger.info("Heatmap trying %s %s", method, url)
 
-        # attempt up to max_pages
-        got_any = False
-        for page in range(1, max_pages + 1):
-            try:
-                params = dict(params_template) if params_template else {}
-                headers = dict(headers_template) if headers_template else {}
-                resp = None
+def extract_countries_from_entity(entity: Dict[str, Any]) -> List[str]:
+    """
+    From a FollowTheMoney entity record, pull out all country-like fields.
+    Heuristic but works across many OpenSanctions datasets.
+    """
+    props: Dict[str, Any] = entity.get("properties", {}) or {}
+    found: List[str] = []
 
-                if "search" in url or "match" in url:
-                    # send POST body for search/match endpoints
-                    if "search" in url:
-                        body = {"q": "*", "page": page, "size": page_size}
-                    else:
-                        # match endpoint expects queries structure — try a very generic query
-                        body = {"queries": {"q1": {"schema": "Person", "limit": page_size, "properties": {"name": ["*"]}}}} 
-                    resp = requests.post(url, params=params, headers=headers, json=body, timeout=30)
-                else:
-                    # GET endpoints (entities, datasets)
-                    p = dict(params)
-                    p.update({"page": page, "size": page_size})
-                    resp = requests.get(url, params=p, headers=headers, timeout=30)
+    for key, value in props.items():
+        lk = key.lower()
+        if "country" in lk or "national" in lk or "citizen" in lk:
+            found.extend(normalize_country(value))
 
-                debug_entry["pages_attempted"] += 1
-                snippet = _safe_json_snippet(resp)
-                if debug_entry["status_first"] is None:
-                    debug_entry["status_first"] = snippet
+    # Sometimes birth places or addresses embed country info
+    for hint_key in ("birthPlace", "placeOfBirth", "address"):
+        if hint_key in props:
+            found.extend(normalize_country(props.get(hint_key)))
 
-                # If upstream returned 404/401/403 — capture and break from paging for this endpoint
-                if resp.status_code == 404:
-                    debug_entry["error"] = f"Upstream 404 on page {page}"
-                    logger.warning("Upstream 404 on %s page %s", url, page)
-                    break
-                if resp.status_code in (401, 403):
-                    debug_entry["error"] = f"Upstream auth error {resp.status_code} on page {page}"
-                    logger.warning("Upstream auth error %s", resp.status_code)
-                    break
-                if resp.status_code >= 400:
-                    # record and break this endpoint (to try next candidate)
-                    debug_entry["error"] = f"Upstream returned {resp.status_code} / {resp.text[:200]}"
-                    logger.warning("Upstream returned error %s %s", resp.status_code, url)
-                    break
+    # unique + non-empty
+    uniq: List[str] = []
+    for c in found:
+        if c and c not in uniq:
+            uniq.append(c)
+    return uniq
 
-                # Parse JSON & extract candidate results
-                j = None
+
+def iter_dataset_names(token: str) -> Iterable[str]:
+    """
+    Use the bulk index.json to discover dataset names.
+    Tries to be tolerant of shape changes.
+    """
+    index_url = f"https://data.opensanctions.org/datasets/latest/index.json?token={token}"
+    logger.info("Fetching dataset index: %s", index_url)
+    try:
+        resp = requests.get(index_url, timeout=30)
+    except requests.RequestException as e:
+        logger.exception("Failed to fetch dataset index")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch dataset index: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenSanctions index returned {resp.status_code}: {resp.text[:500]}",
+        )
+
+    try:
+        data = resp.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="OpenSanctions index returned invalid JSON")
+
+    names: List[str] = []
+
+    # Most likely: {"datasets": {"name": {...}, ...}}
+    if isinstance(data, dict):
+        if "datasets" in data and isinstance(data["datasets"], dict):
+            names = list(data["datasets"].keys())
+        elif "datasets" in data and isinstance(data["datasets"], list):
+            for ds in data["datasets"]:
+                if isinstance(ds, dict) and "name" in ds:
+                    names.append(ds["name"])
+        else:
+            # fallback: treat top-level keys as dataset names
+            for k in data.keys():
+                if isinstance(k, str) and k and not k.startswith("_"):
+                    names.append(k)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "name" in item:
+                names.append(str(item["name"]))
+
+    seen = set()
+    for n in names:
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        yield n
+
+
+def choose_entities_url(dataset_name: str, token: str) -> Tuple[str, str]:
+    """
+    Try a small list of common entity export filenames for a dataset.
+    Returns (url, filename) or (None, None).
+    """
+    base = f"https://data.opensanctions.org/datasets/latest/{dataset_name}"
+    candidates = [
+        "entities.ftm.json",
+        "targets.ftm.json",
+        "entities.json",
+        "targets.json",
+    ]
+    for fname in candidates:
+        url = f"{base}/{fname}?token={token}"
+        try:
+            head = requests.head(url, timeout=15)
+        except requests.RequestException:
+            continue
+        if head.status_code == 200:
+            return url, fname
+    return None, None
+
+
+def stream_entities(url: str) -> Iterable[Dict[str, Any]]:
+    """
+    Stream entities from a JSONL/FTM JSON export.
+    Assumes one JSON object per line (typical for ftm exports).
+    Keeps memory tiny for 512 MB instances.
+    """
+    logger.info("Streaming entities from %s", url)
+    try:
+        with requests.get(url, stream=True, timeout=60) as resp:
+            if resp.status_code != 200:
+                logger.warning("Entity stream %s -> HTTP %s", url, resp.status_code)
+                return
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                stripped = line.strip()
+                # ignore array brackets if not pure JSONL
+                if stripped in ("[", "]", "[{", "},", "}"):
+                    continue
                 try:
-                    j = resp.json()
+                    obj = json.loads(stripped)
                 except Exception:
-                    debug_entry["error"] = f"Upstream returned non-JSON (status {resp.status_code})"
-                    logger.warning("Non-JSON from upstream %s", url)
+                    continue
+                if isinstance(obj, dict):
+                    yield obj
+    except requests.RequestException as e:
+        logger.warning("Error streaming entities from %s: %s", url, e)
+        return
+
+
+def build_heatmap_full(max_entities_global: int = 1_000_000) -> Dict[str, Any]:
+    """
+    Core aggregation:
+    - iterates all datasets visible via bulk delivery
+    - streams entities, extracts countries
+    - counts per country (+ per dataset)
+    - stops after max_entities_global for safety
+    """
+    token = get_delivery_token()
+
+    totals: Counter = Counter()
+    datasets_breakdown: Dict[str, Counter] = defaultdict(Counter)
+    samples: List[Dict[str, Any]] = []
+    debug_attempts: List[Dict[str, Any]] = []
+
+    processed_global = 0
+    dataset_count = 0
+
+    for ds_name in iter_dataset_names(token):
+        dataset_count += 1
+        ds_attempt: Dict[str, Any] = {
+            "dataset": ds_name,
+            "url": None,
+            "entities_tried": 0,
+            "entities_with_country": 0,
+            "error": None,
+        }
+
+        url, fname = choose_entities_url(ds_name, token)
+        ds_attempt["url"] = url
+        if not url:
+            ds_attempt["error"] = "No entity export found"
+            debug_attempts.append(ds_attempt)
+            continue
+
+        try:
+            for ent in stream_entities(url):
+                ds_attempt["entities_tried"] += 1
+                if processed_global >= max_entities_global:
                     break
 
-                # collect candidates & aggregate
-                items = _collect_candidates_from_payload(j)
-                # if _collect_candidates... returned empty, try heuristic: if dict has 'results' or 'matches' keys but empty, accept []
-                if items:
-                    got_any = True
-                    used_url = url
-                    for item in items:
-                        fetched += 1
-                        # identity/nationality heuristics
-                        nats = _extract_nationalities_from_entity(item)
-                        if nats:
-                            for n in nats:
-                                totals[n] += 1
-                        # dataset counts
-                        ds = item.get("datasets") or item.get("dataset") or []
-                        if isinstance(ds, str):
-                            datasets[ds] += 1
-                        elif isinstance(ds, list):
-                            for d in ds:
-                                datasets[str(d)] += 1
-                        # collect up to 20 samples
-                        if len(samples) < 20:
-                            # store small sanitized sample
-                            samples.append({
-                                "name": item.get("name") or item.get("caption") or None,
-                                "score": item.get("score"),
-                                "datasets": item.get("datasets"),
-                                "sources": item.get("sources") or item.get("urls") or None,
-                                "raw": (item.get("id") or item.get("qid") or None)
-                            })
-                    # continue paging until max_pages unless it's a search endpoint that returns empty
-                else:
-                    # If payload contained something but no items, and we got a 200, keep paging (maybe later pages have items).
-                    # For many APIs wildcard search returns empty; we tolerate and continue to next page.
-                    logger.info("No items found on %s page %s", url, page)
-                # If we've collected a lot, stop early
-                if fetched >= (max_pages * page_size):
-                    break
+                countries = extract_countries_from_entity(ent)
+                if not countries:
+                    continue
 
-            except requests.RequestException as ex:
-                debug_entry["error"] = str(ex)
-                logger.exception("Request to %s failed", url)
+                ds_attempt["entities_with_country"] += 1
+                ds_list = ensure_list(ent.get("datasets"))
+
+                for c in countries:
+                    totals[c] += 1
+                    for ds in ds_list:
+                        if ds:
+                            datasets_breakdown[c][ds] += 1
+
+                # collect small sample set for marketing/debug
+                if len(samples) < 80:
+                    props = ent.get("properties") or {}
+                    name_vals = ensure_list(props.get("name"))
+                    samples.append(
+                        {
+                            "id": ent.get("id"),
+                            "name": name_vals[0] if name_vals else None,
+                            "countries": countries,
+                            "datasets": ds_list,
+                        }
+                    )
+
+                processed_global += 1
+
+            debug_attempts.append(ds_attempt)
+
+            if processed_global >= max_entities_global:
+                logger.info(
+                    "Reached global entity cap (%s); stopping aggregation.",
+                    max_entities_global,
+                )
                 break
 
-        debug["attempts"].append(debug_entry)
-        # if we got anything from this candidate, stop trying other endpoints
-        if got_any:
-            break
+        except Exception as e:
+            ds_attempt["error"] = f"Exception while processing: {e}"
+            debug_attempts.append(ds_attempt)
+            continue
 
-    # Prepare return structure
-    totals_sorted = dict(sorted(totals.items(), key=lambda x: -x[1]))
-    datasets_sorted = dict(sorted(datasets.items(), key=lambda x: -x[1]))
+    totals_dict = dict(totals)
+    datasets_dict: Dict[str, Dict[str, int]] = {
+        country: dict(counter) for country, counter in datasets_breakdown.items()
+    }
 
     return {
-        "totals": totals_sorted,
-        "datasets": datasets_sorted,
+        "totals": totals_dict,
+        "datasets": datasets_dict,
         "samples": samples,
         "meta": {
-            "fetched": fetched,
-            "pages": max_pages,
-            "max_pages": max_pages,
-            "used_url": used_url
+            "aggregated_countries": len(totals_dict),
+            "total_entities_with_country": int(sum(totals.values())),
+            "global_entity_cap": max_entities_global,
+            "datasets_seen": dataset_count,
+            "cached_at": int(time.time()),
         },
-        "debug": debug
+        "debug": {
+            "attempts": debug_attempts,
+        },
     }
+
+
+@router.get("")
+@router.get("/")
+def get_heatmap(force: bool = False, cap: int = 1_000_000):
+    """
+    GET /heatmap or /heatmap/
+      - ?force=true  -> rebuild now (ignore cache)
+      - ?cap=200000  -> override global entity cap
+    """
+    now = time.time()
+    ttl = _get_cache_ttl()
+    cached = _HEATMAP_CACHE.get("data")
+    updated = _HEATMAP_CACHE.get("updated_at", 0.0)
+
+    if not force and cached is not None and (now - updated) < ttl:
+        return cached
+
+    try:
+        cap_value = int(cap) if cap else 1_000_000
+    except Exception:
+        cap_value = 1_000_000
+
+    data = build_heatmap_full(max_entities_global=cap_value)
+    _HEATMAP_CACHE["data"] = data
+    _HEATMAP_CACHE["updated_at"] = now
+    return data
