@@ -101,40 +101,64 @@ _COUNTRY_MAP = {
 
 def normalize_country(raw: Any) -> List[str]:
     """
-    Take a raw value (string or list) and return a list of normalized country labels.
-    Kept simple & robust for marketing-level heatmap.
+    Strict country extraction.
+    Removes cities, addresses, numbers, apartment names, etc.
+    Works using ISO-2/3 codes and known country names only.
     """
-    out: List[str] = []
-    for val in ensure_list(raw):
+    if raw is None:
+        return []
+
+    values = ensure_list(raw)
+    out = []
+
+    for val in values:
         if not val:
             continue
+
         s = str(val).strip()
         if not s:
             continue
 
-        # Split common separators: "Russia; Cyprus"
-        parts = [p.strip() for p in s.replace("|", ",").replace(";", ",").split(",") if p.strip()]
-        if len(parts) > 1:
-            for p in parts:
-                out.extend(normalize_country(p))
+        # Remove numeric or address-like values
+        if any(char.isdigit() for char in s):
+            continue
+        if len(s.split()) > 3:
             continue
 
-        u = s.upper()
-        if u in _COUNTRY_MAP:
-            out.append(_COUNTRY_MAP[u])
-            continue
+        # Normalize separators like "Russia; Cyprus"
+        parts = [p.strip() for p in s.replace("|", ",").replace(";", ",").split(",")]
 
-        # ISO-like 2 or 3 letter codes
-        if len(u) in (2, 3) and u.isalpha():
-            out.append(u)
-        else:
-            # Fallback: cleaned label
-            cleaned = s
-            if "(" in cleaned:
-                cleaned = cleaned.split("(", 1)[0].strip()
-            out.append(cleaned)
-    return out
+        for p in parts:
+            upper = p.upper()
 
+            # 1) Check our known map
+            if upper in _COUNTRY_MAP:
+                out.append(_COUNTRY_MAP[upper])
+                continue
+
+            # 2) ISO alpha-2 or alpha-3 codes
+            if len(upper) in (2, 3) and upper.isalpha():
+                out.append(upper)
+                continue
+
+            # 3) Exact match against clean country names
+            if p.lower() in [
+                "india","russia","united states","iran","china","ukraine","belarus",
+                "syria","venezuela","canada","united kingdom","germany",
+                "france","australia","uae","south africa","spain","sweden",
+                "switzerland","netherlands","norway","saudi arabia","qatar",
+                "pakistan","afghanistan","iraq","turkey","mexico","argentina",
+            ]:
+                out.append(p.title())
+                continue
+
+    # Deduplicate
+    final = []
+    for c in out:
+        if c not in final:
+            final.append(c)
+
+    return final
 
 def extract_countries_from_entity(entity: Dict[str, Any]) -> List[str]:
     """
