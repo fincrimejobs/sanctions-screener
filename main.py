@@ -12,6 +12,12 @@ logger = logging.getLogger("screener")
 
 app = FastAPI()
 
+# main.py (somewhere near other imports)
+from heatmap import router as heatmap_router
+
+# then after you create `app = FastAPI()` and configure middleware:
+app.include_router(heatmap_router)
+
 # CORS - in prod, lock this to your specific Webflow domain
 app.add_middleware(
     CORSMiddleware,
