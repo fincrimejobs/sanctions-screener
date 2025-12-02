@@ -1,25 +1,38 @@
 # heatmap.py
 from fastapi import APIRouter, HTTPException
-from typing import Dict, Any, List
+from pydantic import BaseModel
+from typing import Dict, Any, List, Optional
 import os
 import requests
-import time
 import logging
-import json
+import time
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("heatmap")
+router = APIRouter(prefix="/heatmap")
 
-router = APIRouter()
+class HeatmapQuery(BaseModel):
+    max_pages: Optional[int] = 4        # how many pages to fetch (safe default)
+    page_size: Optional[int] = 100      # page size per request (safe default)
+    q: Optional[str] = "*"              # search query (default wildcard)
+    sample_per_country: Optional[int] = 5
 
-# Reusable recursive finder (same idea used in main.py)
+def _safe_int(v, default=0):
+    try:
+        return int(v)
+    except Exception:
+        return default
+
 def recursive_find(obj: Any, keys: List[str]):
+    """Small helper to scan nested dict/list for the first match by key names."""
     if obj is None:
         return None
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if isinstance(k, str) and k.lower() in [kk.lower() for kk in keys]:
-                return v
+            try:
+                if isinstance(k, str) and k.lower() in [kk.lower() for kk in keys]:
+                    return v
+            except Exception:
+                pass
             val = recursive_find(v, keys)
             if val is not None:
                 return val
@@ -30,199 +43,160 @@ def recursive_find(obj: Any, keys: List[str]):
                 return val
     return None
 
-def pick_country_from_entity(e: Dict[str,Any]):
-    # Try common fields and nested identity blocks
-    possible = []
-    for f in ("country", "nationality", "country_of_residence", "citizenship", "countries"):
-        v = e.get(f)
-        if v:
-            possible.append(v)
-    id_block = e.get("identity") or e.get("identities") or {}
-    if id_block:
-        v = recursive_find(id_block, ["country", "nationality", "citizenship", "country_of_residence"])
-        if v:
-            possible.append(v)
-    v = recursive_find(e, ["birth_place", "place_of_birth", "born_in"])
-    if v:
-        possible.append(v)
-    if isinstance(e.get("addresses"), list):
-        for a in e.get("addresses")[:3]:
-            if isinstance(a, dict):
-                c = a.get("country") or a.get("country_code") or recursive_find(a, ["country"])
-                if c:
-                    possible.append(c)
-    for p in possible:
-        if isinstance(p, list) and p:
-            for x in p:
-                if isinstance(x, str) and x.strip():
-                    return x.strip()
-        if isinstance(p, str) and p.strip():
-            return p.strip()
-        if isinstance(p, dict) and p.get("name"):
-            return str(p.get("name")).strip()
+def extract_nationality(record: Dict[str, Any]) -> Optional[str]:
+    # look for common fields that contain a country or nationality
+    cand = recursive_find(record, ["nationality", "country", "citizenship", "country_of_residence"])
+    if isinstance(cand, list) and cand:
+        return cand[0]
+    if isinstance(cand, str) and cand.strip():
+        return cand.strip()
+    # addresses may contain country
+    addr = recursive_find(record, ["addresses", "address"])
+    if isinstance(addr, list):
+        for a in addr:
+            if isinstance(a, dict) and a.get("country"):
+                return a.get("country")
+            if isinstance(a, str) and len(a) > 2:
+                return a
     return None
 
-def summarize_entity(e: Dict[str,Any]):
-    name = e.get("name") or e.get("caption") or recursive_find(e, ["name", "caption"]) or None
-    score = e.get("score") or recursive_find(e, ["score", "confidence"]) or None
-    sources = []
-    if e.get("sources"):
-        if isinstance(e.get("sources"), list):
-            sources = [str(x) for x in e.get("sources")[:6]]
-        else:
-            sources = [str(e.get("sources"))]
-    else:
-        s = recursive_find(e, ["urls", "links", "sources", "url", "link"])
-        if s:
-            if isinstance(s, list):
-                sources = [str(x) for x in s[:6]]
-            else:
-                sources = [str(s)]
-    return {"name": name, "score": float(score) if (score is not None and str(score).strip()) else None, "sources": sources}
+def extract_name(record: Dict[str, Any]) -> str:
+    name = record.get("caption") or record.get("name") or recursive_find(record, ["name", "caption"]) or ""
+    return str(name)
 
-def unpack_entities_page(resp_json):
-    candidates = []
-    if isinstance(resp_json, dict):
-        for k in ("results", "entities", "data", "items", "hits", "rows"):
-            if k in resp_json and resp_json[k]:
-                if isinstance(resp_json[k], list):
-                    candidates.extend(resp_json[k])
-                    break
-                elif isinstance(resp_json[k], dict) and "items" in resp_json[k] and isinstance(resp_json[k]["items"], list):
-                    candidates.extend(resp_json[k]["items"])
-                    break
-        if not candidates:
-            if "id" in resp_json and ("name" in resp_json or "caption" in resp_json):
-                candidates.append(resp_json)
-    elif isinstance(resp_json, list):
-        candidates.extend(resp_json)
-    return candidates
+def extract_datasets(record: Dict[str, Any]) -> List[str]:
+    ds = record.get("datasets") or record.get("dataset") or recursive_find(record, ["datasets", "dataset", "lists"])
+    if not ds:
+        return []
+    if isinstance(ds, str):
+        return [ds]
+    if isinstance(ds, list):
+        return [str(x) for x in ds if x]
+    # fallback: try to convert iterable
+    try:
+        return list(ds)
+    except Exception:
+        return []
 
-@router.get("/heatmap")
-def heatmap(max_pages: int = 8, page_size: int = 200):
+@router.get("/", summary="Heatmap summary (aggregates OpenSanctions results)")
+def heatmap_get(max_pages: Optional[int] = 4, page_size: Optional[int] = 100, q: Optional[str] = "*"):
     """
-    Produces a country-count heatmap from OpenSanctions.
-    - max_pages: how many pages to try
-    - page_size: page size to request
+    Simple GET wrapper so you can call /heatmap?max_pages=2&page_size=50&q=*
+    Default q="*" (wildcard). Uses POST /search under the hood (OpenSanctions expects POST).
     """
+    body = HeatmapQuery(max_pages=max_pages, page_size=page_size, q=q)
+    return heatmap_post(body)
+
+@router.post("/", summary="Heatmap - POST")
+def heatmap_post(query: HeatmapQuery):
     api_key = os.getenv("OPENSANCTIONS_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="OPENSANCTIONS_KEY not set on server")
+        raise HTTPException(status_code=500, detail="Server misconfigured: OPENSANCTIONS_KEY not set")
 
-    base_urls_to_try = [
-        "https://api.opensanctions.org/entities",
-        "https://api.opensanctions.org/data/entities",
-        "https://api.opensanctions.org/search"   # fallback - called with q='*' now
-    ]
-
-    totals = {}
-    samples = {}
+    base_url = "https://api.opensanctions.org/search"
+    used_url = base_url
+    totals: Dict[str, int] = {}
+    datasets_count: Dict[str, int] = {}
+    samples: Dict[str, List[str]] = {}
     fetched = 0
-    used_url = None
-    first_response_snippet = None
+    debug = {"first_response_snippet": None, "errors": []}
+    max_pages = max(1, _safe_int(query.max_pages, 4))
+    page_size = max(1, min(500, _safe_int(query.page_size, 100)))  # cap page_size to reasonable max
+    q = query.q or "*"
+    sample_per_country = max(1, _safe_int(query.sample_per_country, 5))
 
-    for base in base_urls_to_try:
-        logger.info("Trying heatmap base URL: %s", base)
-        used_url = base
-        totals = {}
-        samples = {}
-        fetched = 0
-        first_response_snippet = None
+    headers = {"Content-Type": "application/json"}
+    # You can include api_key as query param (same pattern used elsewhere in your project)
+    params = {"api_key": api_key}
 
-        for p in range(1, max_pages + 1):
-            # If we are using the search endpoint, require a broad query param
-            params = {"api_key": api_key, "page": p, "size": page_size}
-            if base.endswith("/search"):
-                # Use q=* to request a broad search result (search endpoint requires q)
-                params["q"] = "*"
-
-            try:
-                r = requests.get(base, params=params, timeout=20)
-            except requests.RequestException as exc:
-                logger.warning("Request to %s failed (page %s): %s", base, p, str(exc))
-                time.sleep(0.5)
-                continue
-
-            # Always capture a snippet (text or JSON) for debugging if nothing is found later
-            snippet = None
-            try:
-                j = r.json()
-                # small pretty snippet won't exceed large payloads
-                snippet = j if isinstance(j, dict) and len(str(j)) < 4000 else str(j)[:2000]
-            except Exception:
-                snippet = r.text[:2000] if r.text else f"status:{r.status_code}"
-
-            if first_response_snippet is None:
-                first_response_snippet = {"status": r.status_code, "snippet": snippet}
-
-            if r.status_code == 404:
-                logger.info("Endpoint %s returned 404 - skipping to next candidate", base)
-                break
-            if r.status_code in (401, 403):
-                logger.error("Auth error (%s) from %s: %s", r.status_code, base, (r.text[:200] if r.text else ""))
-                break
-
-            # attempt to parse JSON into page_entities
-            page_entities = []
-            try:
-                j = r.json()
-                page_entities = unpack_entities_page(j)
-            except Exception:
-                logger.warning("Non-JSON response at %s page %s: %s", base, p, r.text[:200])
-                page_entities = []
-
-            if not page_entities:
-                logger.info("No entities found on %s page %s (no candidate array)", base, p)
-                # if this was the search fallback and it returned empty on p=1, try next base
-                if p == 1:
-                    break
-                else:
-                    # continue to next page attempt
-                    continue
-
-            # process entities
-            for ent in page_entities:
-                fetched += 1
-                c = pick_country_from_entity(ent) or recursive_find(ent, ["country", "nationality", "citizenship", "country_of_residence"])
-                if c:
-                    if isinstance(c, dict) and "name" in c:
-                        cstr = str(c.get("name"))
-                    else:
-                        cstr = str(c)
-                    cstr = cstr.strip()
-                    if not cstr:
-                        continue
-                    totals[cstr] = totals.get(cstr, 0) + 1
-                    if cstr not in samples and isinstance(ent, dict):
-                        samples[cstr] = summarize_entity(ent)
-                else:
-                    addr_country = recursive_find(ent, ["country", "country_name", "country_code"])
-                    if addr_country:
-                        cstr = str(addr_country).strip()
-                        if cstr:
-                            totals[cstr] = totals.get(cstr, 0) + 1
-                            if cstr not in samples:
-                                samples[cstr] = summarize_entity(ent)
-            # if fewer than page_size items, probably last page
-            if len(page_entities) < page_size:
-                logger.info("Page %s had %s items (< page_size=%s) — stopping pagination for base %s", p, len(page_entities), page_size, base)
-                break
-            time.sleep(0.12)
-
-        if fetched > 0 or totals:
-            logger.info("Found %s country records using base %s", fetched, base)
+    for page in range(1, max_pages + 1):
+        payload = {"q": q, "page": page, "size": page_size}
+        try:
+            resp = requests.post(base_url, params=params, json=payload, timeout=30)
+        except requests.RequestException as e:
+            logger.exception("OpenSanctions request failed")
+            debug["errors"].append(str(e))
             break
-        else:
-            logger.info("No country records found using base %s — trying next candidate", base)
-            continue
 
-    sorted_totals = {k: totals[k] for k in sorted(totals, key=totals.get, reverse=True)}
-    meta = {"fetched": fetched, "pages": max_pages, "max_pages": max_pages, "used_url": used_url}
+        # capture first response snippet for debugging
+        if debug["first_response_snippet"] is None:
+            try:
+                debug["first_response_snippet"] = {"status": resp.status_code, "snippet": resp.text[:1000]}
+            except Exception:
+                debug["first_response_snippet"] = {"status": resp.status_code, "snippet": None}
 
-    if not sorted_totals:
-        return {"totals": {}, "samples": {}, "meta": meta, "debug": {"first_response_snippet": first_response_snippet}}
+        if resp.status_code == 404:
+            # often indicates wrong method/path or missing permission — stop and return debug
+            debug["errors"].append(f"Upstream 404 on page {page} (method=POST). URL: {resp.url}")
+            break
+        if resp.status_code >= 400:
+            debug["errors"].append(f"Upstream non-200 on page {page}: {resp.status_code}")
+            # try to include body
+            try:
+                debug["errors"].append(resp.text[:1000])
+            except Exception:
+                pass
+            break
 
-    top_countries = list(sorted_totals.keys())[:20]
-    sample_small = {c: samples.get(c) for c in top_countries[:10] if c in samples}
+        try:
+            data = resp.json()
+        except Exception:
+            debug["errors"].append("Upstream returned non-JSON or invalid JSON")
+            break
 
-    return {"totals": sorted_totals, "samples": sample_small, "meta": meta}
+        # search endpoint shapes vary: try to find results in several places
+        results = []
+        if isinstance(data, dict):
+            # many responses include "results" or "matches" or "hits"
+            if "results" in data and isinstance(data["results"], list):
+                results = data["results"]
+            elif "matches" in data and isinstance(data["matches"], list):
+                results = data["matches"]
+            elif "hits" in data and isinstance(data["hits"], list):
+                results = data["hits"]
+            else:
+                # some OpenSanctions responses return top-level list inside 'data' or similar nested structure
+                # try to find the first list value
+                for k, v in data.items():
+                    if isinstance(v, list):
+                        results = v
+                        break
+        elif isinstance(data, list):
+            results = data
+
+        # if no results: stop paging (either true empty or endpoint doesn't support wildcard)
+        if not results:
+            # if this was the very first page, include debug snippet
+            if fetched == 0:
+                debug["errors"].append("No results returned from upstream (empty results list). Check query or endpoint access.")
+            break
+
+        # process results
+        for r in results:
+            fetched += 1
+            # attempt to coerce into normalized record fields
+            name = extract_name(r)
+            nationality = extract_nationality(r) or "Unknown"
+            # update totals by nationality
+            totals[nationality] = totals.get(nationality, 0) + 1
+            # add sample names per nationality (limit)
+            samples.setdefault(nationality, [])
+            if len(samples[nationality]) < sample_per_country:
+                samples[nationality].append(name or "—")
+
+            # datasets
+            ds_list = extract_datasets(r)
+            for ds in ds_list:
+                datasets_count[ds] = datasets_count.get(ds, 0) + 1
+
+        # small polite pause to avoid rate limits if user requested many pages
+        time.sleep(0.15)
+
+    meta = {
+        "fetched": fetched,
+        "pages": min(max_pages, page),
+        "max_pages": max_pages,
+        "used_url": used_url
+    }
+
+    return {"totals": totals, "datasets": datasets_count, "samples": samples, "meta": meta, "debug": debug}
